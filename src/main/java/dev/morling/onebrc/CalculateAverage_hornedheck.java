@@ -19,33 +19,56 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.stream.Collector;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class CalculateAverage_hornedheck {
     
     private static final String FILE = "./measurements.txt";
     
     public static void main( String[] args ) throws IOException {
-        List<String> lines = Files.lines(Paths.get(FILE)).toList();
+        Stream<String> lines = Files.lines(Paths.get(FILE))
+                                    .collect(Collectors.toUnmodifiableList())
+                                    .stream();
         
         long start = System.currentTimeMillis();
         
-        Map<String, MeasurementAggregator> results = new HashMap<>();
+        Collector<Measurement, MeasurementAggregator, ResultRow> collector = Collector.of(
+            MeasurementAggregator::new,
+            ( aggregator, measurement ) -> {
+                aggregator.sum += measurement.temp;
+                aggregator.count++;
+                aggregator.min = Math.min(aggregator.min, measurement.temp);
+                aggregator.max = Math.max(aggregator.max, measurement.temp);
+            },
+            ( aggregator1, aggregator2 ) -> {
+                aggregator1.count += aggregator2.count;
+                aggregator1.sum += aggregator2.sum;
+                aggregator1.min = Math.min(aggregator1.min, aggregator2.min);
+                aggregator1.max = Math.max(aggregator1.max, aggregator2.max);
+                return aggregator1;
+            },
+            aggregator -> new ResultRow(
+                aggregator.min / 10.0,
+                aggregator.sum / 10.0 / aggregator.count,
+                aggregator.max / 10.0
+            )
+        );
         
-        lines.forEach(line -> {
-            String[] parts = line.split(";");
-            if ( results.containsKey(parts[0]) ) {
-                results.get(parts[0]).update(
-                    parseInt(parts[1]));
-            } else {
-                results.put(parts[0], new MeasurementAggregator(
-                    parseInt(parts[1])));
-            }
-        });
+        var res = lines.map(str -> {
+            String[] parts = str.split(";");
+            return new Measurement(parts[0], parseInt(parts[1]));
+        }).collect(
+            Collectors.groupingBy(
+                ( m ) -> m.name,
+                collector
+            )
+        );
         
-        System.out.println(new TreeMap<>(results));
+        System.out.println(new TreeMap<>(res));
         System.out.println(System.currentTimeMillis() - start);
     }
     
@@ -67,30 +90,26 @@ public class CalculateAverage_hornedheck {
         return -res;
     }
     
+    private record Measurement(String name, int temp) {}
     
     private static class MeasurementAggregator {
         
-        private int min;
-        private int max;
-        private int sum;
-        private long count;
+        private int min = 999;
+        private int max = -999;
+        private int sum = 0;
+        private long count = 0;
         
-        public MeasurementAggregator( int temp ) {
-            this.min = temp;
-            this.max = temp;
-            this.sum = temp;
-            this.count = 1;
-        }
-        
-        void update( int temp ) {
-            sum += temp;
-            count++;
-            if ( min > temp ) {
-                min = temp;
-            } else if ( max < temp ) {
-                max = temp;
-            }
-        }
+        public MeasurementAggregator() {}
     }
     
+    private static record ResultRow(double min, double mean, double max) {
+        
+        public String toString() {
+            return round(min) + "/" + round(mean) + "/" + round(max);
+        }
+        
+        private double round( double value ) {
+            return Math.round(value * 10.0) / 10.0;
+        }
+    }
 }
