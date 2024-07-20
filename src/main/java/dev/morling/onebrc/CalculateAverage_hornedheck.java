@@ -18,12 +18,18 @@ package dev.morling.onebrc;
 import jdk.incubator.vector.ShortVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
+import sun.misc.Unsafe;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.Collector;
 import java.util.stream.Collectors;
@@ -38,10 +44,53 @@ public class CalculateAverage_hornedheck {
     private static final ShortVector MULTIPLER = ShortVector.fromArray(CHAR_CONVERSION_SPECIE, new short[]{
         100, 10, 1, 0
     }, 0);
-    private static short[] tempDigits = new short[CHAR_CONVERSION_SPECIE.length()];
-    private static HashMap<String, ResultRow> map = new HashMap<>(10000);
+    private static final short[] tempDigits = new short[CHAR_CONVERSION_SPECIE.length()];
+    private static final MethodHandle mismatch;
+    private static final Unsafe theUnsafe;
+    private static final Map<CheapName, ResultRow> map = new HashMap<>(10000, 1.0f);
+    private static final long VALUE_FIELD_OFFSET;
+    private static final long SIZE_FIELD_OFFSET;
+    private static final long BYTES_FIELD_OFFSET;
+    private static char charBuff;
+    private static short sign;
+    private static int length;
     
-    public static void main( String[] args ) throws IOException {
+    static {
+        
+        try {
+            Field f = Unsafe.class.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            theUnsafe = (Unsafe) f.get(null);
+            
+            VALUE_FIELD_OFFSET = fieldOffset(String.class, "value");
+            SIZE_FIELD_OFFSET = fieldOffset(CheapName.class, "size");
+            BYTES_FIELD_OFFSET = fieldOffset(CheapName.class, "bytes");
+            
+            Class<?> arraysSupport = Class.forName("jdk.internal.util.ArraysSupport");
+            var lookup = MethodHandles.privateLookupIn(arraysSupport, MethodHandles.lookup());
+            // int mismatch(byte[] a, int aFromIndex, byte[] b, int bFromIndex, int length)
+            mismatch = lookup.findStatic(
+                arraysSupport, "mismatch",
+                MethodType.methodType(
+                    int.class,
+                    byte[].class,
+                    int.class,
+                    byte[].class,
+                    int.class,
+                    int.class
+                )
+            );
+        } catch (Exception e) {
+            throw new Error(e);
+        }
+    }
+    
+    private static <T> long fieldOffset( Class<T> cls, String name ) throws NoSuchFieldException {
+        Field field = cls.getDeclaredField(name);
+        return theUnsafe.objectFieldOffset(field);
+    }
+    
+    public static void main( String[] args ) throws IOException, NoSuchFieldException, IllegalAccessException, ClassNotFoundException, NoSuchMethodException {
         Arrays.fill(tempDigits, (short) '0');
         
         Stream<String> lines = Files.lines(Paths.get(FILE))
@@ -101,42 +150,27 @@ public class CalculateAverage_hornedheck {
                 return aggregator1;
             },
             aggregator -> {
-                int sum = aggregator.sum;
-                int min = aggregator.min;
-                int max = aggregator.max;
                 
                 for ( int i = 0; i < aggregator.used; i++ ) {
-                    sum += aggregator.values[i];
-                    min = Math.min(min, aggregator.values[i]);
-                    max = Math.max(max, aggregator.values[i]);
+                    aggregator.sum += aggregator.values[i];
+                    aggregator.min = Math.min(aggregator.min, aggregator.values[i]);
+                    aggregator.max = Math.max(aggregator.max, aggregator.values[i]);
                 }
                 
                 return new ResultRow(
-                    min / 10.0,
-                    sum / 10.0 / aggregator.count,
-                    max / 10.0
+                    aggregator.min / 10.0,
+                    aggregator.sum / 10.0 / aggregator.count,
+                    aggregator.max / 10.0
                 );
             }
         );
         
         var res = lines.map(str -> {
-            int length = str.length();
-            if ( str.charAt(length - 4) == ';' ) {
-                return new Measurement(
-                    str.substring(0, length - 4),
-                    parseShortVectorized(str, 3)
-                );
-            } else if ( str.charAt(length - 5) == ';' ) {
-                return new Measurement(
-                    str.substring(0, length - 5),
-                    parseShortVectorized(str, 4)
-                );
-            } else {
-                return new Measurement(
-                    str.substring(0, length - 6),
-                    parseShortVectorized(str, 5)
-                );
-            }
+            int index = indexOfDel(str);
+            return new Measurement(
+                new CheapName(str, index),
+                parseShortVectorized(str, index)
+            );
         }).collect(
             Collectors.groupingBy(
                 ( m ) -> m.name,
@@ -149,38 +183,30 @@ public class CalculateAverage_hornedheck {
         System.out.println(System.currentTimeMillis() - start);
     }
     
-    private static short parseShort( String temp ) {
-        int length = temp.length();
-        int res = temp.charAt(length - 1) - '0'
-            + ( temp.charAt(length - 3) - '0' ) * 10;
-        char ch;
-        if ( length < 4 ) {
-            return (short) res;
+    private static int indexOfDel( String src ) {
+        length = src.length();
+        if ( src.charAt(length - 4) == ';' ) {
+            return length - 4;
         }
-        ch = temp.charAt(length - 4);
-        if ( ch == '-' ) {
-            return (short) -res;
+        if ( src.charAt(length - 5) == ';' ) {
+            return length - 5;
         }
-        res += ch - '0';
-        if ( length < 5 )
-            return (short) res;
-        return (short) -res;
+        return length - 6;
     }
     
-    private static short parseShortVectorized( String temp, int offset ) {
-        int length = temp.length();
+    private static short parseShortVectorized( String temp, int index ) {
         tempDigits[2] = (short) temp.charAt(length - 1);
         //skip '.'
         tempDigits[1] = (short) temp.charAt(length - 3);
-        short sign = 1;
-        switch (offset) {
+        sign = 1;
+        switch (length - index - 1) {
             case 4:
-                char firstChar = temp.charAt(length - 4);
-                if ( firstChar == '-' ) {
+                charBuff = temp.charAt(length - 4);
+                if ( charBuff == '-' ) {
                     sign = -1;
                     tempDigits[0] = '0';
                 } else {
-                    tempDigits[0] = (short) firstChar;
+                    tempDigits[0] = (short) charBuff;
                 }
                 break;
             case 5:
@@ -195,7 +221,7 @@ public class CalculateAverage_hornedheck {
         return (short) ( tempModulus * sign );
     }
     
-    private record Measurement(String name, short temp) {}
+    private record Measurement(CheapName name, short temp) {}
     
     private static class MeasurementAggregator {
         private int sum = 0;
@@ -223,6 +249,47 @@ public class CalculateAverage_hornedheck {
         
         private double round( double value ) {
             return Math.round(value * 10.0) / 10.0;
+        }
+    }
+    
+    private static class CheapName implements Comparable<CheapName> {
+        
+        private final byte[] bytes;
+        private final int size;
+        
+        private int hashCode;
+        
+        public CheapName( String src, int size ) {
+            this.bytes = (byte[]) theUnsafe.getObject(src, VALUE_FIELD_OFFSET);
+            this.size = size;
+            hashCode = 1;
+            for ( int i = 0; i < size; ++i ) {
+                hashCode = 31 * hashCode + bytes[i];
+            }
+        }
+        
+        @Override
+        public int compareTo( CheapName other ) {
+            int lim = Math.min(size, other.size);
+            int k = -1;
+            for ( int i = 0; i < lim; i++ ) {
+                if ( bytes[i] != other.bytes[i] ) {
+                    k = i;
+                    break;
+                }
+            }
+            return k < 0 ? size - other.size : bytes[k] - other.bytes[k];
+        }
+        
+        @Override
+        public int hashCode() {
+            return hashCode;
+        }
+        
+        @Override
+        public boolean equals( Object obj ) {
+//            Arrays.equals()
+            return hashCode == obj.hashCode();
         }
     }
 }
